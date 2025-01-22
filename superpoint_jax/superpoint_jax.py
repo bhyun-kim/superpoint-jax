@@ -181,7 +181,7 @@ class VGGBlock(nnx.Module):
         x = self.bn(x)         
         return x
 
-class SuperPoint(nnx.Module):
+class SuperPointJAX(nnx.Module):
     """
     Flax NNX re-implementation of the SuperPoint model.
     By default, expects inputs in NHWC format: (B, H, W, 1 or 3).
