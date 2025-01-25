@@ -49,7 +49,7 @@ def select_top_k_keypoints(keypoints, scores, k):
     return keypoints[indices], scores
 
 
-class VGGBlock(nn.Sequential):
+class VGGBlockTorch(nn.Sequential):
     def __init__(self, c_in, c_out, kernel_size, relu=True):
         padding = (kernel_size - 1) // 2
         conv = nn.Conv2d(
@@ -87,7 +87,7 @@ class SuperPointTorch(nn.Module):
 
         backbone = []
         for i, c in enumerate(channels[1:], 1):
-            layers = [VGGBlock(channels[i - 1], c, 3), VGGBlock(c, c, 3)]
+            layers = [VGGBlockTorch(channels[i - 1], c, 3), VGGBlockTorch(c, c, 3)]
             if i < len(channels) - 1:
                 layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
             backbone.append(nn.Sequential(*layers))
@@ -95,12 +95,12 @@ class SuperPointTorch(nn.Module):
 
         c = self.conf.channels[-1]
         self.detector = nn.Sequential(
-            VGGBlock(channels[-1], c, 3),
-            VGGBlock(c, self.stride**2 + 1, 1, relu=False),
+            VGGBlockTorch(channels[-1], c, 3),
+            VGGBlockTorch(c, self.stride**2 + 1, 1, relu=False),
         )
         self.descriptor = nn.Sequential(
-            VGGBlock(channels[-1], c, 3),
-            VGGBlock(c, self.conf.descriptor_dim, 1, relu=False),
+            VGGBlockTorch(channels[-1], c, 3),
+            VGGBlockTorch(c, self.conf.descriptor_dim, 1, relu=False),
         )
 
     def forward(self, data):

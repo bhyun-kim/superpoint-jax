@@ -1,9 +1,5 @@
 __version__ = "0.1.0"
 
-from .superpoint_jax import SuperPointJAX
-from .superpoint_torch import SuperPointTorch
+from .model import SuperPointJAX, SuperPointTorch, VGGBlockNNX, VGGBlockTorch
 
-__all__ = [
-    "SuperPointJAX",
-    "SuperPointTorch",
-]
+__all__ = ['SuperPointJAX', 'SuperPointTorch', 'VGGBlockNNX', 'VGGBlockTorch']

@@ -61,7 +61,7 @@ def bilinear_grid_sample_jax(images: jnp.ndarray, coords: jnp.ndarray) -> jnp.nd
     )(images, x0c, x1c, y0c, y1c, w_tl, w_tr, w_bl, w_br)
     return out  # (B, C, N)
 
-
+@partial(jax.jit, static_argnums=(2,))
 def sample_descriptors_jax(keypoints: jnp.ndarray, descriptors: jnp.ndarray, s: int = 8) -> jnp.ndarray:
     """
     keypoints: (B, N, 2) pixel coordinates
@@ -266,7 +266,6 @@ class SuperPointJAX(nnx.Module):
         }
         """
         B, _, _, C = image.shape
-        temp_out = {}
         # Convert to grayscale if input has 3 channels.
         if C == 3:
             scale = jnp.array([0.299, 0.587, 0.114], dtype=image.dtype)
