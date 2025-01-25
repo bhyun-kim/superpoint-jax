@@ -139,7 +139,7 @@ def select_top_k_keypoints_jax(keypoints: jnp.ndarray,
     top_kpts = jnp.take(keypoints, top_indices, axis=0)
     return top_kpts, top_scores
 
-class VGGBlock(nnx.Module):
+class VGGBlockNNX(nnx.Module):
     """A small block of Conv -> ReLU -> (optional) BN in NNX style."""
     def __init__(
         self,
@@ -214,13 +214,13 @@ class SuperPointJAX(nnx.Module):
 
         # For each stage:
         for i, out_ch in enumerate(self.channels[:-1]):
-            vgg1 = VGGBlock(
+            vgg1 = VGGBlockNNX(
                 in_features=in_ch,
                 out_features=out_ch,
                 rngs=rngs
             )
 
-            vgg2 = VGGBlock(
+            vgg2 = VGGBlockNNX(
                 in_features=out_ch,
                 out_features=out_ch,
                 rngs=rngs
@@ -243,15 +243,15 @@ class SuperPointJAX(nnx.Module):
         # Detector head
         # ---------------------------
         c = self.channels[-1]
-        det1 = VGGBlock(self.channels[-2], c, kernel_size=3, rngs=rngs)
-        det2 = VGGBlock(c, self.stride**2 + 1, kernel_size=1, relu=False, rngs=rngs)
+        det1 = VGGBlockNNX(self.channels[-2], c, kernel_size=3, rngs=rngs)
+        det2 = VGGBlockNNX(c, self.stride**2 + 1, kernel_size=1, relu=False, rngs=rngs)
         self.detector = nnx.Sequential(det1, det2)
 
         # ---------------------------
         # Descriptor head
         # ---------------------------
-        desc1 = VGGBlock(self.channels[-2], c, kernel_size=3, rngs=rngs)
-        desc2 = VGGBlock(c, descriptor_dim, kernel_size=1, relu=False, rngs=rngs)
+        desc1 = VGGBlockNNX(self.channels[-2], c, kernel_size=3, rngs=rngs)
+        desc2 = VGGBlockNNX(c, descriptor_dim, kernel_size=1, relu=False, rngs=rngs)
         self.descriptor = nnx.Sequential(desc1, desc2)
 
     def __call__(self, image: jnp.ndarray, training: bool = False):
