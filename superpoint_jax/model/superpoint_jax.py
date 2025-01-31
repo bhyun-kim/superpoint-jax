@@ -89,13 +89,17 @@ def extract_keypoints_and_descriptors(
     stride: int,
 ):
     """
-    High-level Python function that calls the jitted `_extract_keypoints_padded`.
-    By default, it returns a dictionary of standard Python lists of (N_i, ...) arrays.
-
-    If you want to keep everything in JAX arrays (padded + mask),
-    simply return the padded outputs directly.
+    Returns:
+        {
+            "keypoints":   (B, max_k, 2),
+            "scores":      (B, max_k),
+            "descriptors": (B, max_k, C'),
+            "valid_mask":  (B, max_k),
+            "valid_counts":(B,)
+        }
+      with invalid entries zeroed out in the returned arrays.
     """
-    # (1) Get padded arrays + valid_mask/count from jitted function
+    # (1) Call jitted function to get padded results and valid_mask
     kpts_yx_b, scores_b, desc_b, valid_mask_b, valid_counts_b = _extract_keypoints_padded(
         scores_nms,
         desc_dense,
@@ -103,43 +107,18 @@ def extract_keypoints_and_descriptors(
         max_k,
         stride
     )
-    #   kpts_yx_b:   (B, max_k, 2)
-    #   scores_b:    (B, max_k)
-    #   desc_b:      (B, max_k, C')
-    #   valid_mask_b:(B, max_k)
-    #   valid_counts_b:(B,)
 
-    # (2) Optional: Convert to CPU arrays & build Python lists
-    # This final step is outside JIT, so it won't slow your main pipeline.
-    kpts_list = []
-    scores_list = []
-    desc_list = []
+    # (2) Zero out invalid entries
+    kpts_yx_b_masked = jnp.where(valid_mask_b[..., None], kpts_yx_b, 0.0)
+    scores_b_masked  = jnp.where(valid_mask_b, scores_b, 0.0)
+    desc_b_masked    = jnp.where(valid_mask_b[..., None], desc_b, 0.0)
 
-    # Convert once to numpy if you need standard NumPy arrays
-    # (if you stay in JAX, you can skip this step)
-    kpts_yx_b_np = np.array(kpts_yx_b)
-    scores_b_np  = np.array(scores_b)
-    desc_b_np    = np.array(desc_b)
-    mask_b_np    = np.array(valid_mask_b)
-
-    B = kpts_yx_b.shape[0]
-    for i in range(B):
-        mask_i = mask_b_np[i]  # shape (max_k,) of bool
-
-        kpts_i = kpts_yx_b_np[i][mask_i]   # (N_i, 2)
-        scrs_i = scores_b_np[i][mask_i]    # (N_i,)
-        desc_i = desc_b_np[i][mask_i]      # (N_i, C')
-
-        kpts_list.append(kpts_i)
-        scores_list.append(scrs_i)
-        desc_list.append(desc_i)
-
+    # (3) Return masked arrays (still padded) + mask/valid_counts
     return {
-        "keypoints":   kpts_list,   # list of length B
-        "scores":      scores_list, # list of length B
-        "descriptors": desc_list,   # list of length B
-        # "valid_mask":  valid_mask_b,  # (B, max_k) in JAX array form
-        # "valid_counts": valid_counts_b # (B,) in JAX array form
+        "keypoints":   kpts_yx_b_masked,  # (B, max_k, 2), invalid are zeros
+        "scores":      scores_b_masked,   # (B, max_k), invalid are zeros
+        "descriptors": desc_b_masked,     # (B, max_k, C'), invalid are zeros
+        "valid_counts": valid_counts_b,   # (B,) integer
     }
 
 
