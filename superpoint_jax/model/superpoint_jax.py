@@ -10,6 +10,179 @@ from flax.linen.pooling import max_pool
 from functools import partial
 from flax import nnx
 
+from time import time
+
+import jax
+import jax.numpy as jnp
+from jax import jit
+
+# @jit
+# def mask_padded_keypoints(
+#     keypoints: jnp.ndarray,       # (B, max_k, 2)
+#     scores: jnp.ndarray,          # (B, max_k)
+#     descriptors: jnp.ndarray,     # (B, max_k, C')
+#     valid_counts: jnp.ndarray,    # (B,)
+# ):
+#     """
+#     Returns masked_kpts, masked_scores, masked_descs, mask:
+    
+#     - masked_kpts:    (B, max_k, 2)
+#       invalid entries are replaced by -1
+#     - masked_scores:  (B, max_k)
+#       invalid entries replaced by -∞ (so they can be ignored in downstream top-k ops, etc.)
+#     - masked_descs:   (B, max_k, C')
+#       invalid entries replaced by 0
+#     - mask:           (B, max_k) of bool
+#       True where the entry is valid, False otherwise.
+#     """
+#     B, max_k, _ = keypoints.shape
+    
+#     # row_ids => shape (max_k,)
+#     row_ids = jnp.arange(max_k)
+#     # mask => shape (B, max_k) 
+#     # True if row_ids < valid_counts[b], else False
+#     mask = row_ids[None, :] < valid_counts[:, None]
+
+#     # Now replace invalid entries with sentinel values:
+#     masked_kpts = jnp.where(
+#         mask[..., None],              # broadcast mask to shape (B, max_k, 1)
+#         keypoints,                    # valid => original
+#         -jnp.ones_like(keypoints)     # invalid => -1
+#     )
+#     masked_scores = jnp.where(
+#         mask,
+#         scores,
+#         -jnp.inf * jnp.ones_like(scores)
+#     )
+#     masked_descs = jnp.where(
+#         mask[..., None],
+#         descriptors,
+#         jnp.zeros_like(descriptors)
+#     )
+#     return masked_kpts, masked_scores, masked_descs
+
+
+@partial(jax.jit, static_argnames=['max_k', 'stride'])
+def _extract_keypoints_padded(
+    scores_nms: jnp.ndarray,        # (B, HH, WW)
+    desc_dense: jnp.ndarray,        # (B, H', W', C')
+    detection_threshold: float,
+    max_k: int,
+    stride: int,
+):
+    """
+    Returns three padded arrays:
+      - kpts_yx_b: (B, max_k, 2)
+      - scores_b:  (B, max_k)
+      - desc_b:    (B, max_k, C')
+    Each image has exactly 'max_k' entries, but some might be invalid (-∞ scores).
+    """
+    B, HH, WW = scores_nms.shape
+
+    def process_single(scores_map, desc_map):
+        """
+        scores_map: (HH, WW)
+        desc_map:   (H', W', C')
+        
+        Returns:
+          top_yx:     (max_k, 2)   # padded (y, x)
+          top_scores: (max_k,)     # padded
+          desc_sampled: (max_k, C')
+        """
+        # (1) Flatten
+        scores_flat = scores_map.ravel()  # shape (HH*WW,)
+
+        # (2) Mask out below threshold by assigning -∞
+        mask = scores_flat > detection_threshold
+        masked_scores = jnp.where(mask, scores_flat, -jnp.inf)
+
+        # (3) top_k over entire flattened array
+        top_scores, top_indices = jax.lax.top_k(masked_scores, max_k)
+
+        # (4) Convert top_indices -> (y, x)
+        top_y = top_indices // WW
+        top_x = top_indices % WW
+        top_yx = jnp.stack([top_y, top_x], axis=-1)  # (max_k, 2)
+
+        # (5) Sample descriptors
+        # Flip (y,x)->(x,y) for descriptor sampling
+        xy = top_yx[:, ::-1]  
+        # shape => (1, max_k, 2) so we can pass to sample fn
+        coords_batched = xy[None]          
+        # shape => (1, H', W', C')
+        desc_map_batched = desc_map[None]  
+
+        # Suppose you have a function "sample_descriptors_jax"
+        desc_sampled = sample_descriptors_jax(
+            coords_batched, desc_map_batched, s=stride
+        )[0].T  # => (max_k, C')
+
+        return top_yx, top_scores, desc_sampled
+
+    # We apply process_single to each (scores_map, desc_map) in the batch
+    kpts_yx_b, scores_b, desc_b = jax.vmap(process_single)(scores_nms, desc_dense)
+    return kpts_yx_b, scores_b, desc_b
+
+
+def extract_keypoints_and_descriptors(
+    scores_nms: jnp.ndarray,
+    desc_dense: jnp.ndarray,
+    detection_threshold: float,
+    max_k: int,
+    stride: int,
+):
+    """
+    Returns a dictionary:
+      {
+        "keypoints":   [kpts_1, ..., kpts_B],  # each shape (N_i, 2)
+        "scores":      [scores_1, ..., scores_B], # each shape (N_i,)
+        "descriptors": [desc_1, ..., desc_B], # each shape (N_i, C')
+      }
+    with no 'valid_counts' stored. The lengths N_i depend on threshold + top_k.
+    """
+    # (1) Get padded arrays from jitted function
+    kpts_yx_b, scores_b, desc_b = _extract_keypoints_padded(
+        scores_nms, 
+        desc_dense, 
+        detection_threshold, 
+        max_k, 
+        stride
+    )
+    # shapes:
+    #   kpts_yx_b => (B, max_k, 2)
+    #   scores_b  => (B, max_k)
+    #   desc_b    => (B, max_k, C')
+
+    B = kpts_yx_b.shape[0]
+
+    # (2) Final Python loop that discards invalid (score == -∞) points
+    # and builds a Python list for each output.
+    keypoints_list = []
+    scores_list = []
+    descriptors_list = []
+
+    for i in range(B):
+        # convert to NumPy for slicing
+        scores_i = scores_b[i]  # shape (max_k,)
+        
+        # mask out -∞
+        valid_mask = scores_i > float('-inf')
+
+        # gather each
+        kpts_i = kpts_yx_b[i][valid_mask]       # shape (N_i, 2)
+        scores_i = scores_i[valid_mask]            # shape (N_i,)
+        desc_i = desc_b[i][valid_mask]          # shape (N_i, C')
+
+        keypoints_list.append(kpts_i)
+        scores_list.append(scores_i)
+        descriptors_list.append(desc_i)
+
+    return {
+        "keypoints":   keypoints_list,   # list of length B
+        "scores":      scores_list,      # list of length B
+        "descriptors": descriptors_list, # list of length B
+    }
+
 
 def bilinear_grid_sample_jax(images: jnp.ndarray, coords: jnp.ndarray) -> jnp.ndarray:
     """
@@ -61,7 +234,7 @@ def bilinear_grid_sample_jax(images: jnp.ndarray, coords: jnp.ndarray) -> jnp.nd
     )(images, x0c, x1c, y0c, y1c, w_tl, w_tr, w_bl, w_br)
     return out  # (B, C, N)
 
-@partial(jax.jit, static_argnums=(2,))
+@partial(jax.jit, static_argnames=["s"])
 def sample_descriptors_jax(keypoints: jnp.ndarray, descriptors: jnp.ndarray, s: int = 8) -> jnp.ndarray:
     """
     keypoints: (B, N, 2) pixel coordinates
@@ -81,7 +254,6 @@ def sample_descriptors_jax(keypoints: jnp.ndarray, descriptors: jnp.ndarray, s: 
     norm = jnp.sqrt((sampled ** 2).sum(axis=1, keepdims=True) + eps)
     descriptors_norm = sampled / norm
     return descriptors_norm
-
 
 def max_pool_2d(x: jnp.ndarray, nms_radius: int) -> jnp.ndarray:
     """
@@ -255,6 +427,69 @@ class SuperPointJAX(nnx.Module):
         self.descriptor = nnx.Sequential(desc1, desc2)
 
     def __call__(self, image: jnp.ndarray, training: bool = False):
+        
+        B, H, W, C = image.shape
+        # Convert to grayscale if input has 3 channels.
+        if C == 3:
+            scale = jnp.array([0.299, 0.587, 0.114], dtype=image.dtype)
+            image = jnp.sum(image * scale[None, None, None, :], axis=-1, keepdims=True)
+
+        features, scores, desc_dense = self.forward(image, training=training)
+
+        t3 = time()
+        # reshape => (B, H'*stride, W'*stride)
+        scores = jnp.reshape(
+            scores,
+            (B, features.shape[1], features.shape[2], self.stride, self.stride)
+        )
+        scores = jnp.transpose(scores, (0, 1, 3, 2, 4))  # => (B, H', R, W', R)
+        B2, Hp, R1, Wp, R2 = scores.shape
+        scores = jnp.reshape(scores, (B2, Hp * R1, Wp * R2))
+        t4 = time()
+        print(f"Reshape time: {t4 - t3}")
+
+        # NMS
+        scores_nms = batched_nms_jax(scores, self.nms_radius)  # shape (B, HH, WW)
+        t5 = time()
+        print(f"NMS time: {t5 - t4}")
+
+        @partial(jax.jit, static_argnames=["pad"])
+        def remove_borders(scores_nms, pad):
+            # scores_nms has shape (B, HH, WW)
+            # Match PyTorch logic by setting each border region to -1
+            scores_nms = scores_nms.at[:, :pad, :].set(-1)    # top
+            scores_nms = scores_nms.at[:, -pad:, :].set(-1)   # bottom
+            scores_nms = scores_nms.at[:, :, :pad].set(-1)    # left
+            scores_nms = scores_nms.at[:, :, -pad:].set(-1)   # right
+            return scores_nms
+
+        if self.remove_borders > 0:
+            scores_nms = remove_borders(scores_nms, self.remove_borders)
+
+        _, HH, WW = scores_nms.shape
+        t6 = time()
+        print(f"Border time: {t6 - t5}")
+
+        if self.max_num_keypoints is None:
+            max_k = HH * WW
+        else:
+            max_k = self.max_num_keypoints
+
+        # desc_dense => shape (B, H', W', C').
+        # We'll pass them + scores_nms to the jitted extraction fn.
+        # Make sure your extract_keypoints_and_descriptors returns valid_counts too!
+        return extract_keypoints_and_descriptors(
+            scores_nms=scores_nms,
+            desc_dense=desc_dense,
+            detection_threshold=self.detection_threshold,
+            max_k=max_k,
+            stride=self.stride,
+        )
+
+        
+        
+    @partial(nnx.jit, static_argnames=["training"])
+    def forward(self, image: jnp.ndarray, training: bool = False):
         """
         Forward pass for SuperPoint in Flax NNX, matching the original PyTorch logic.
 
@@ -265,18 +500,16 @@ class SuperPointJAX(nnx.Module):
             "descriptors": list of length B, each an array of shape (N_i, descriptor_dim)
         }
         """
-        B, _, _, C = image.shape
-        # Convert to grayscale if input has 3 channels.
-        if C == 3:
-            scale = jnp.array([0.299, 0.587, 0.114], dtype=image.dtype)
-            image = jnp.sum(image * scale[None, None, None, :], axis=-1, keepdims=True)
-
+        t0 = time()
         # Backbone features
         if training:
             self.backbone.train()
         else:
             self.backbone.eval()
+        
         features = self.backbone(image, training=training)  
+        t1 = time()
+        print(f"Backbone time: {t1-t0}")
 
         # Descriptor head
         if training:
@@ -285,6 +518,8 @@ class SuperPointJAX(nnx.Module):
             self.descriptor.eval()
 
         desc_dense = self.descriptor(features, training=training)
+        t2 = time()
+        print(f"Descriptor time: {t2-t1}")
         eps = 1e-8
         norm = jnp.sqrt(jnp.sum(desc_dense**2, axis=3, keepdims=True) + eps)
         desc_dense = desc_dense / norm  
@@ -297,73 +532,9 @@ class SuperPointJAX(nnx.Module):
             self.detector.eval()
 
         scores = self.detector(features, training=training)  # (B, H', W', stride^2+1)
-
+        t3 = time()
+        print(f"Detector time: {t3-t2}")
         # softmax over last channel => discard last channel => (B, H', W', stride^2)
         scores = jax.nn.softmax(scores, axis=3)[..., :-1]
 
-        # reshape => (B, H'*stride, W'*stride)
-        scores = jnp.reshape(scores, (B, features.shape[1], features.shape[2], self.stride, self.stride))
-        scores = jnp.transpose(scores, (0, 1, 3, 2, 4))  # => (B, H', R, W', R)
-        B2, Hp, R1, Wp, R2 = scores.shape
-        scores = jnp.reshape(scores, (B2, Hp * R1, Wp * R2))
-
-
-        # NMS
-        scores_nms = batched_nms_jax(scores, self.nms_radius)  # shape (B, HH, WW)
-
-
-        # Remove borders
-        if self.remove_borders > 0:
-            pad = self.remove_borders
-            # scores_nms has shape (B, HH, WW)
-            # Match PyTorch logic by setting each border region to -1
-            scores_nms = scores_nms.at[:, :pad, :].set(-1)    # top
-            scores_nms = scores_nms.at[:, -pad:, :].set(-1)   # bottom
-            scores_nms = scores_nms.at[:, :, :pad].set(-1)    # left
-            scores_nms = scores_nms.at[:, :, -pad:].set(-1)   # right
-
-        _, _, WW = scores_nms.shape
-
-        # Threshold => gather keypoints => sample descriptors
-        results = {
-            "keypoints": [],
-            "keypoint_scores": [],
-            "descriptors": [],
-        }
-
-        def gather_keypoints(scores_map):
-            # scores_map => (HH, WW), single-batch
-            # flatten
-            scores_flat = scores_map.ravel()  # shape (HH*WW,)
-            idxs = jnp.where(scores_flat > self.detection_threshold)[0]
-            # => positions in [0..HH*WW)
-            # convert idx -> (row, col) => (y, x)
-            yx = jnp.stack((idxs // WW, idxs % WW), axis=-1)
-            s = scores_flat[idxs]
-            return yx, s
-
-        # shape => (B, HH, WW)
-        for b_idx in range(B):
-            scores_map = scores_nms[b_idx]
-            yx, s = gather_keypoints(scores_map)  # shape => (N,2), (N,)
-
-            # If specified, apply top-k
-            if self.max_num_keypoints is not None:
-                yx, s = select_top_k_keypoints_jax(yx, s, self.max_num_keypoints)
-
-            # sample descriptors, using the (x,y) convention
-            # The above 'yx' is (row, col) => (y, x). Let's flip => (x,y)
-            xy = jnp.flip(yx, axis=-1)  # shape => (N,2)
-            coords_b = xy[None]         # shape => (1,N,2)
-            desc_b   = desc_dense[b_idx:b_idx+1]  # shape => (1,H',W',C')
-            desc_sampled = sample_descriptors_jax(coords_b, desc_b, s=self.stride)
-            # desc_sampled => (1, C', N)
-            desc_sampled = desc_sampled[0]  # => (C', N)
-
-            # store results
-            results["keypoints"].append(yx)        # (N,2) in (y,x)
-            results["keypoint_scores"].append(s)   # (N,)
-            # transpose descriptors => shape => (N, C')
-            results["descriptors"].append(jnp.swapaxes(desc_sampled, 0, 1))
-
-        return results
+        return features, scores, desc_dense

@@ -5,5 +5,5 @@ __all__ = [
     "SuperPointJAX",
     "SuperPointTorch",
     "VGGBlockNNX",
-    "VGGBlockTorch",
+    "VGGBlockTorch"
 ]
