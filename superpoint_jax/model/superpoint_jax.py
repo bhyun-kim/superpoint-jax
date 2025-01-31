@@ -9,58 +9,9 @@ import jax.numpy as jnp
 from flax.linen.pooling import max_pool
 from functools import partial
 from flax import nnx
+import numpy as np
 
 from time import time
-
-import jax
-import jax.numpy as jnp
-from jax import jit
-
-# @jit
-# def mask_padded_keypoints(
-#     keypoints: jnp.ndarray,       # (B, max_k, 2)
-#     scores: jnp.ndarray,          # (B, max_k)
-#     descriptors: jnp.ndarray,     # (B, max_k, C')
-#     valid_counts: jnp.ndarray,    # (B,)
-# ):
-#     """
-#     Returns masked_kpts, masked_scores, masked_descs, mask:
-    
-#     - masked_kpts:    (B, max_k, 2)
-#       invalid entries are replaced by -1
-#     - masked_scores:  (B, max_k)
-#       invalid entries replaced by -∞ (so they can be ignored in downstream top-k ops, etc.)
-#     - masked_descs:   (B, max_k, C')
-#       invalid entries replaced by 0
-#     - mask:           (B, max_k) of bool
-#       True where the entry is valid, False otherwise.
-#     """
-#     B, max_k, _ = keypoints.shape
-    
-#     # row_ids => shape (max_k,)
-#     row_ids = jnp.arange(max_k)
-#     # mask => shape (B, max_k) 
-#     # True if row_ids < valid_counts[b], else False
-#     mask = row_ids[None, :] < valid_counts[:, None]
-
-#     # Now replace invalid entries with sentinel values:
-#     masked_kpts = jnp.where(
-#         mask[..., None],              # broadcast mask to shape (B, max_k, 1)
-#         keypoints,                    # valid => original
-#         -jnp.ones_like(keypoints)     # invalid => -1
-#     )
-#     masked_scores = jnp.where(
-#         mask,
-#         scores,
-#         -jnp.inf * jnp.ones_like(scores)
-#     )
-#     masked_descs = jnp.where(
-#         mask[..., None],
-#         descriptors,
-#         jnp.zeros_like(descriptors)
-#     )
-#     return masked_kpts, masked_scores, masked_descs
-
 
 @partial(jax.jit, static_argnames=['max_k', 'stride'])
 def _extract_keypoints_padded(
@@ -71,11 +22,12 @@ def _extract_keypoints_padded(
     stride: int,
 ):
     """
-    Returns three padded arrays:
-      - kpts_yx_b: (B, max_k, 2)
-      - scores_b:  (B, max_k)
-      - desc_b:    (B, max_k, C')
-    Each image has exactly 'max_k' entries, but some might be invalid (-∞ scores).
+    Returns five arrays, each of shape (B, max_k) or (B, max_k, 2) or (B, max_k, C'):
+      - kpts_yx_b:   (B, max_k, 2)    (padded keypoint coordinates)
+      - scores_b:    (B, max_k)       (padded scores)
+      - desc_b:      (B, max_k, C')   (padded descriptors)
+      - mask_b:      (B, max_k) of bool
+      - count_b:     (B,)  number of valid keypoints in each image
     """
     B, HH, WW = scores_nms.shape
 
@@ -83,18 +35,23 @@ def _extract_keypoints_padded(
         """
         scores_map: (HH, WW)
         desc_map:   (H', W', C')
-        
+
         Returns:
-          top_yx:     (max_k, 2)   # padded (y, x)
-          top_scores: (max_k,)     # padded
+          top_yx:       (max_k, 2)   # (y, x)
+          top_scores:   (max_k,)
           desc_sampled: (max_k, C')
+          valid_mask:   (max_k,) of bool
+          valid_count:  scalar count of True in valid_mask
         """
         # (1) Flatten
         scores_flat = scores_map.ravel()  # shape (HH*WW,)
 
         # (2) Mask out below threshold by assigning -∞
-        mask = scores_flat > detection_threshold
-        masked_scores = jnp.where(mask, scores_flat, -jnp.inf)
+        masked_scores = jnp.where(
+            scores_flat > detection_threshold,
+            scores_flat,
+            -jnp.inf
+        )
 
         # (3) top_k over entire flattened array
         top_scores, top_indices = jax.lax.top_k(masked_scores, max_k)
@@ -106,22 +63,22 @@ def _extract_keypoints_padded(
 
         # (5) Sample descriptors
         # Flip (y,x)->(x,y) for descriptor sampling
-        xy = top_yx[:, ::-1]  
-        # shape => (1, max_k, 2) so we can pass to sample fn
-        coords_batched = xy[None]          
-        # shape => (1, H', W', C')
-        desc_map_batched = desc_map[None]  
-
-        # Suppose you have a function "sample_descriptors_jax"
+        xy = top_yx[:, ::-1]
+        coords_batched = xy[None]         # shape => (1, max_k, 2)
+        desc_map_batched = desc_map[None] # shape => (1, H', W', C')
         desc_sampled = sample_descriptors_jax(
             coords_batched, desc_map_batched, s=stride
         )[0].T  # => (max_k, C')
 
-        return top_yx, top_scores, desc_sampled
+        # (6) valid_mask & count
+        valid_mask = top_scores > -jnp.inf  # shape (max_k,)
+        valid_count = jnp.sum(valid_mask)
 
-    # We apply process_single to each (scores_map, desc_map) in the batch
-    kpts_yx_b, scores_b, desc_b = jax.vmap(process_single)(scores_nms, desc_dense)
-    return kpts_yx_b, scores_b, desc_b
+        return top_yx, top_scores, desc_sampled, valid_mask, valid_count
+
+    # Vectorize over batch
+    kpts_yx_b, scores_b, desc_b, mask_b, count_b = jax.vmap(process_single)(scores_nms, desc_dense)
+    return kpts_yx_b, scores_b, desc_b, mask_b, count_b
 
 
 def extract_keypoints_and_descriptors(
@@ -132,56 +89,59 @@ def extract_keypoints_and_descriptors(
     stride: int,
 ):
     """
-    Returns a dictionary:
-      {
-        "keypoints":   [kpts_1, ..., kpts_B],  # each shape (N_i, 2)
-        "scores":      [scores_1, ..., scores_B], # each shape (N_i,)
-        "descriptors": [desc_1, ..., desc_B], # each shape (N_i, C')
-      }
-    with no 'valid_counts' stored. The lengths N_i depend on threshold + top_k.
+    High-level Python function that calls the jitted `_extract_keypoints_padded`.
+    By default, it returns a dictionary of standard Python lists of (N_i, ...) arrays.
+
+    If you want to keep everything in JAX arrays (padded + mask),
+    simply return the padded outputs directly.
     """
-    # (1) Get padded arrays from jitted function
-    kpts_yx_b, scores_b, desc_b = _extract_keypoints_padded(
-        scores_nms, 
-        desc_dense, 
-        detection_threshold, 
-        max_k, 
+    # (1) Get padded arrays + valid_mask/count from jitted function
+    kpts_yx_b, scores_b, desc_b, valid_mask_b, valid_counts_b = _extract_keypoints_padded(
+        scores_nms,
+        desc_dense,
+        detection_threshold,
+        max_k,
         stride
     )
-    # shapes:
-    #   kpts_yx_b => (B, max_k, 2)
-    #   scores_b  => (B, max_k)
-    #   desc_b    => (B, max_k, C')
+    #   kpts_yx_b:   (B, max_k, 2)
+    #   scores_b:    (B, max_k)
+    #   desc_b:      (B, max_k, C')
+    #   valid_mask_b:(B, max_k)
+    #   valid_counts_b:(B,)
+
+    # (2) Optional: Convert to CPU arrays & build Python lists
+    # This final step is outside JIT, so it won't slow your main pipeline.
+    kpts_list = []
+    scores_list = []
+    desc_list = []
+
+    # Convert once to numpy if you need standard NumPy arrays
+    # (if you stay in JAX, you can skip this step)
+    kpts_yx_b_np = np.array(kpts_yx_b)
+    scores_b_np  = np.array(scores_b)
+    desc_b_np    = np.array(desc_b)
+    mask_b_np    = np.array(valid_mask_b)
 
     B = kpts_yx_b.shape[0]
-
-    # (2) Final Python loop that discards invalid (score == -∞) points
-    # and builds a Python list for each output.
-    keypoints_list = []
-    scores_list = []
-    descriptors_list = []
-
     for i in range(B):
-        # convert to NumPy for slicing
-        scores_i = scores_b[i]  # shape (max_k,)
-        
-        # mask out -∞
-        valid_mask = scores_i > float('-inf')
+        mask_i = mask_b_np[i]  # shape (max_k,) of bool
 
-        # gather each
-        kpts_i = kpts_yx_b[i][valid_mask]       # shape (N_i, 2)
-        scores_i = scores_i[valid_mask]            # shape (N_i,)
-        desc_i = desc_b[i][valid_mask]          # shape (N_i, C')
+        kpts_i = kpts_yx_b_np[i][mask_i]   # (N_i, 2)
+        scrs_i = scores_b_np[i][mask_i]    # (N_i,)
+        desc_i = desc_b_np[i][mask_i]      # (N_i, C')
 
-        keypoints_list.append(kpts_i)
-        scores_list.append(scores_i)
-        descriptors_list.append(desc_i)
+        kpts_list.append(kpts_i)
+        scores_list.append(scrs_i)
+        desc_list.append(desc_i)
 
     return {
-        "keypoints":   keypoints_list,   # list of length B
-        "scores":      scores_list,      # list of length B
-        "descriptors": descriptors_list, # list of length B
+        "keypoints":   kpts_list,   # list of length B
+        "scores":      scores_list, # list of length B
+        "descriptors": desc_list,   # list of length B
+        # "valid_mask":  valid_mask_b,  # (B, max_k) in JAX array form
+        # "valid_counts": valid_counts_b # (B,) in JAX array form
     }
+
 
 
 def bilinear_grid_sample_jax(images: jnp.ndarray, coords: jnp.ndarray) -> jnp.ndarray:
